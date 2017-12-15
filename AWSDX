@@ -1,0 +1,175 @@
+Param( 
+    [string]
+    $DXAccountId = '333733109183',
+
+    [string]
+    $DXLinkId = 'dxcon-fh86ahni',
+
+    [Parameter(Mandatory=$True)]
+    [string]
+    $Agency,
+
+    [Parameter(Mandatory=$True)]
+    [string]
+    $Environment,
+
+    [Parameter(Mandatory=$True)]
+    [int]
+    $DXVLANId, 
+
+    [Parameter(Mandatory=$True)]
+    [string]
+    $DXNet,
+
+    [Parameter(Mandatory=$True)]
+    [string]
+    $BGPKey
+
+)
+# This script is to manage the AWS side of the DX link connections 
+# - Creates Virtual Gateway 
+# - Offer Virtual interface from root DX link
+# - Accept on destination account and attach to gateway
+# - Update all default route tables 
+
+Import-Module AWSPowerShell
+Import-Module SSCAWSADFSPowerShell 
+Import-Module IPBasicNetworking
+
+##############
+# Auth/VPC Setup 
+###############
+
+# Remove the existing account list as there seems to be an issue with overriding them 
+if ( Test-path -Path '~/AppData/Local/AWSToolkit/RegisteredAccounts.json') {
+    remove-item -Path '~/AppData/Local/AWSToolkit/RegisteredAccounts.json' 
+}
+
+$CredObjects = Get-Content -Path '~/AWSProfiles.json' | ConvertFrom-Json
+# Setup the Manual Auth Profiles 
+ForEach ( $Cred in $CredObjects) { 
+    Set-SSCAWSAuthManual -Agency $($Cred.Agency) -Environment $($Cred.Environment) -SecretKey $($Cred.SecretKey) -AccessKey $($Cred.AccessKey)
+}
+# Setup the Proxy, Attempt SAML Auth and Set default region
+Set-SSCAWSEnv -ManualAuthOnly
+
+# Get VPC info
+$VPCBasicInfo = Get-SSCAWSVPC
+
+
+# Create a new Virtual Gateway for the Customer Account
+function New-DXLink { 
+    param (
+        [Parameter(Mandatory=$true)][string]$Agency,
+        [Parameter(Mandatory=$true)][string]$Environment,
+        [Parameter(Mandatory=$true)][string]$DXAccountId,
+        [Parameter(Mandatory=$true)][string]$DXLinkId,
+        [Parameter(Mandatory=$true)][int]$DXVlanId,
+        [Parameter(Mandatory=$true)][string]$DXNet,
+        [Parameter(Mandatory=$true)][string]$BGPKey,
+        $VPCDetails = $VPCBasicInfo
+    )
+    
+    # Set BGP ASN
+    [int]$SSCBGPASN = 9509
+
+    # Find the Dest Account using the Environment Details
+    $DestAuthProfile = ($VPCDetails | Where-Object { $_.Agency -eq $Agency -and $_.Environment -eq $Environment}).AccountProfile 
+    $VpcId = ($VPCDetails | Where-Object { $_.Agency -eq $Agency -and $_.Environment -eq $Environment}).VPCId
+    $AccountId = ($VPCDetails | Where-Object { $_.Agency -eq $Agency -and $_.Environment -eq $Environment}).AccountId
+    
+    # Find the Root Account using the Account Id 
+    $RootAuthProfile = ($VPCDetails | Where-Object { $_.AccountId -eq $DXAccountId }).AccountProfile 
+
+    # See if the account has an existing VPN Gateway 
+    $ExistingGateway = Get-EC2VpnGateway -ProfileName $DestAuthProfile  -Filter @( @{ name='attachment.state'; value='attached' }; @{ name='attachment.vpc-id'; value=$VpcId } ) 
+    
+    if ( $ExistingGateway -eq $null ) {
+        # Create a new Gateway if one doesnt exist
+         $VPNGateway = New-EC2VpnGateway -Type ipsec.1 -ProfileName $DestAuthProfile 
+        # Attach the Gateway to the VPC
+         $GatewayAttach = Add-EC2VpnGateway -VpcId $VpcId -VpnGatewayId $($VPNGateway.VpnGatewayId) -ProfileName $DestAuthProfile 
+    }
+    else {
+        $VPNGateway = $ExistingGateway
+    }
+        
+    #Gateway Details
+    $SSCGateway = $((Get-NetworkDetails -IPCidr $($DXNet) ).FirstIP)
+    $AWSGateway = $((Get-NetworkDetails -IPCidr $($DXNet) ).LastIP)
+    $CidrMask = $((Get-NetworkDetails -IPCidr $($DXNet) ).CidrMask)
+    
+    # Offer new VI Link
+    $DXLink = Enable-DCPrivateVirtualInterface `
+                -NewPrivateVirtualInterfaceAllocation_CustomerAddress "$($SSCGateway)/$($CidrMask)" `
+                -NewPrivateVirtualInterfaceAllocation_AmazonAddress "$($AWSGateway)/$($CidrMask)" `
+                -NewPrivateVirtualInterfaceAllocation_Asn $($SSCBGPASN) `
+                -NewPrivateVirtualInterfaceAllocation_AuthKey $($BGPKey) `
+                -ConnectionId $($DXLinkId) `
+                -OwnerAccount $($AccountId) `
+                -NewPrivateVirtualInterfaceAllocation_VirtualInterfaceName "DX_$($Agency)-$($Environment)" `
+                -NewPrivateVirtualInterfaceAllocation_Vlan $($DXVlanId) `
+                -ProfileName $RootAuthProfile 
+   
+    # Accept the Link      
+    $AcceptLink = Confirm-DCPrivateVirtualInterface -VirtualInterfaceId $($DXLink.VirtualInterfaceId) -VirtualGatewayId $($VPNGateway.VpnGatewayId) -ProfileName $DestAuthProfile 
+
+    #Find the routetables - Ignore the main routetable as this should not be used
+    $RouteTables = Get-EC2RouteTable -Filter @( @{ name='association.main'; value='false' }; @{ name='vpc-id'; value=$VpcId } ) -ProfileName $DestAuthProfile 
+    
+    # Add the Route to the Source Routing Tables
+    foreach ( $RouteTable in $RouteTables ) {
+        # Allow Gateway to advertise networks to Routetable   
+        $RoutePropagation = Enable-EC2VgwRoutePropagation -GatewayId $($VPNGateway.VpnGatewayId) -RouteTableId $($RouteTable.RouteTableId) -ProfileName $DestAuthProfile 
+        # Add Static Default Route 
+        $DefaultRoute = New-EC2Route -destinationCidrBlock "0.0.0.0/0" -GatewayId $($VPNGateway.VpnGatewayId) -RouteTableId $($RouteTable.RouteTableId) -ProfileName $DestAuthProfile 
+       
+    }
+   
+     $VirtualGatewayConfirm = Get-EC2VpnGateway -ProfileName $DestAuthProfile  -Filter @( @{ name='attachment.state'; value='attached' }; @{ name='attachment.vpc-id'; value=$VpcId } )
+     $DXlinkConfirm = Get-DCVirtualInterface -VirtualInterfaceId $($DXLink.VirtualInterfaceId) -ProfileName  $RootAuthProfile
+     
+     $DXLinkResponce = New-Object psobject
+     $DXLinkResponce | Add-Member -MemberType NoteProperty -Name VirtualGatewayId -Value  $($VirtualGatewayConfirm.VpnGatewayId)
+     $DXLinkResponce | Add-Member -MemberType NoteProperty -Name VirtualGatewayStatus -Value  $($VirtualGatewayConfirm.State)
+     $DXLinkResponce | Add-Member -MemberType NoteProperty -Name VirtualInterfaceId -Value $($DXlinkConfirm.VirtualInterfaceId)
+     $DXLinkResponce | Add-Member -MemberType NoteProperty -Name VirtualInterfaceState -Value $($DXlinkConfirm.VirtualInterfaceState)
+     
+     return $DXLinkResponce
+}
+
+function Get-DXLinks {
+    param (
+       [Parameter(Mandatory=$true)][string]$DXAccountId,
+       $VPCDetails = $VPCBasicInfo
+    )
+    # Find the Root Account using the Account Id 
+    $RootAuthProfile = ($VPCDetails | Where-Object { $_.AccountId -eq $DXAccountId}).AccountProfile 
+
+    # Get Current DX Links 
+    $DCConnections = Get-DCConnection -ProfileName $RootAuthProfile
+
+
+    return $DCConnections
+}
+
+function Get-VirtualInterfaces {
+    param (
+       [Parameter(Mandatory=$true)][string]$DXAccountId,
+       $VPCDetails = $VPCBasicInfo
+    )
+    # Find the Root Account using the Account Id 
+    $RootAuthProfile = ($VPCDetails | Where-Object { $_.AccountId -eq $DXAccountId}).AccountProfile 
+
+    $VirtualInterfaces = Get-DCVirtualInterface -ProfileName $RootAuthProfile 
+    
+    return $VirtualInterfaces
+}
+
+
+# Gets the Physical DX Links assigned based on Account Id Number - (The Root account doesn't have a VPC)
+Get-DXLinks -DXAccountId  "" | Format-Table -AutoSize -Property ConnectionName,ConnectionId,ConnectionState,Bandwidth,Location
+Get-VirtualInterfaces -DXAccountId  "" | Sort-Object -Property VirtualInterfaceState -Descending | Format-table -AutoSize -Property VirtualInterfaceName,VirtualInterfaceState 
+
+# Template for DX Link Creation 
+New-DXLink -DXAccountId $DXAccountId -Agency $Agency -Environment $Environment -DXLinkId $DXLinkId -DXVlanId $DXVLANId -DXNet $DXNet -BGPKey $BGPKey
